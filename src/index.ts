@@ -17,12 +17,13 @@ import {
   ListToolsRequestSchema,
 } from '@modelcontextprotocol/sdk/types.js';
 import * as dotenv from 'dotenv';
+import * as path from 'path';
 import { MultiRegionManager } from './config/sp-api.js';
 import { getMarketplaceConfig } from './config/marketplaces.js';
 import { allDefinitions, allHandlers } from './tools/index.js';
 import { ToolContext } from './tools/types.js';
 
-dotenv.config();
+dotenv.config({ path: path.join(__dirname, '..', '..', '.env') });
 
 class AmazonSellerCentralServer {
   private server: Server;
