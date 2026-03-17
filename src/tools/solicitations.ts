@@ -291,7 +291,7 @@ async function requestReview(
     const response = await ctx.client.request(
       {
         method: 'POST',
-        path: `/solicitations/v1/orders/${encodeURIComponent(orderId)}/solicitations/productReviewAndSellerFeedbackSolicitation`,
+        path: `/solicitations/v1/orders/${encodeURIComponent(orderId)}/solicitations/productReviewAndSellerFeedback`,
         queryParams: { marketplaceIds: ctx.marketplaceId },
       },
       'solicitations'
@@ -460,7 +460,7 @@ async function bulkRequestReviews(
       const response = await ctx.client.request(
         {
           method: 'POST',
-          path: `/solicitations/v1/orders/${encodeURIComponent(orderId)}/solicitations/productReviewAndSellerFeedbackSolicitation`,
+          path: `/solicitations/v1/orders/${encodeURIComponent(orderId)}/solicitations/productReviewAndSellerFeedback`,
           queryParams: { marketplaceIds: ctx.marketplaceId },
         },
         'solicitations'
