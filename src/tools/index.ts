@@ -13,6 +13,9 @@ import * as pricing from './pricing.js';
 import * as sales from './sales.js';
 import * as seller from './seller.js';
 import * as solicitations from './solicitations.js';
+import * as fbaInbound from './fba-inbound.js';
+import * as fulfillment from './fulfillment.js';
+import * as feeds from './feeds.js';
 
 export type { ToolDefinition, ToolHandler, ToolContext } from './types.js';
 
@@ -26,6 +29,9 @@ export const allDefinitions: ToolDefinition[] = [
   ...sales.definitions,
   ...seller.definitions,
   ...solicitations.definitions,
+  ...fbaInbound.definitions,
+  ...fulfillment.definitions,
+  ...feeds.definitions,
 ];
 
 export const allHandlers: Record<string, ToolHandler> = {
@@ -38,4 +44,7 @@ export const allHandlers: Record<string, ToolHandler> = {
   ...sales.handlers,
   ...seller.handlers,
   ...solicitations.handlers,
+  ...fbaInbound.handlers,
+  ...fulfillment.handlers,
+  ...feeds.handlers,
 };

@@ -21,6 +21,8 @@ interface ReviewRequestLog {
   marketplaceId: string;
   status: 'success' | 'error' | 'not_eligible';
   message: string;
+  httpStatus?: number;
+  responseBody?: unknown;
 }
 
 function logReviewRequest(entry: ReviewRequestLog): void {
@@ -34,7 +36,50 @@ function logReviewRequest(entry: ReviewRequestLog): void {
   }
 }
 
+/**
+ * Check if an SP-API response body indicates an error even on HTTP 200.
+ * Some SP-API endpoints return 200 with error details in the body.
+ */
+function checkResponseForErrors(data: unknown): string | null {
+  if (!data || typeof data !== 'object') return null;
+
+  const obj = data as Record<string, unknown>;
+
+  // Check for explicit errors array in response
+  if (Array.isArray(obj.errors) && obj.errors.length > 0) {
+    const firstErr = obj.errors[0] as Record<string, unknown>;
+    return firstErr?.message as string || firstErr?.code as string || 'Unknown API error in response body';
+  }
+
+  // Check for "Access denied" patterns in response
+  if (typeof obj.message === 'string' && (
+    obj.message.includes('denied') ||
+    obj.message.includes('Unauthorized') ||
+    obj.message.includes('not authorized')
+  )) {
+    return obj.message;
+  }
+
+  return null;
+}
+
 export const definitions: ToolDefinition[] = [
+  {
+    name: 'test_solicitations_permission',
+    description:
+      'Diagnostic tool: Tests whether your SP-API app has the Solicitations permission enabled. Makes a lightweight GET request to the Solicitations API and reports the exact response. Use this BEFORE running bulk review requests to verify permissions are working.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        marketplace: MARKETPLACE_PARAM,
+        order_id: {
+          type: 'string',
+          description: 'Any valid Amazon order ID to test with (e.g., a recent shipped order)',
+        },
+      },
+      required: ['marketplace', 'order_id'],
+    },
+  },
   {
     name: 'check_review_eligibility',
     description:
@@ -107,6 +152,104 @@ export const definitions: ToolDefinition[] = [
   },
 ];
 
+async function testSolicitationsPermission(
+  args: Record<string, unknown>,
+  ctx: ToolContext
+): Promise<string> {
+  const orderId = args.order_id as string;
+  const marketplace = args.marketplace as string;
+
+  const diagnostics: Record<string, unknown> = {
+    test: 'solicitations_permission',
+    marketplace,
+    marketplaceId: ctx.marketplaceId,
+    orderId,
+    timestamp: new Date().toISOString(),
+    steps: [] as Array<Record<string, unknown>>,
+  };
+
+  const steps = diagnostics.steps as Array<Record<string, unknown>>;
+
+  // Step 1: Test getSolicitationActionsForOrder (GET — read-only, safe)
+  try {
+    const response = await ctx.client.request(
+      {
+        method: 'GET',
+        path: `/solicitations/v1/orders/${encodeURIComponent(orderId)}`,
+        queryParams: { marketplaceIds: ctx.marketplaceId },
+      },
+      'solicitations'
+    );
+
+    const bodyError = checkResponseForErrors(response.data);
+
+    steps.push({
+      step: 'getSolicitationActionsForOrder',
+      httpStatus: response.status,
+      success: !bodyError,
+      responseBody: response.data,
+      bodyError: bodyError || null,
+    });
+
+    if (bodyError) {
+      diagnostics.result = 'FAIL';
+      diagnostics.diagnosis = `Solicitations API returned HTTP ${response.status} but body contains error: ${bodyError}. This likely means the Solicitations role is NOT granted on your SP-API app.`;
+    } else {
+      diagnostics.result = 'PASS';
+      diagnostics.diagnosis = 'Solicitations permission is ACTIVE. The API returned solicitation actions for this order.';
+    }
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    const isDenied = message.includes('denied') || message.includes('403') || message.includes('Unauthorized') || message.includes('FORBIDDEN');
+
+    steps.push({
+      step: 'getSolicitationActionsForOrder',
+      success: false,
+      error: message,
+      isDenied,
+    });
+
+    if (isDenied) {
+      diagnostics.result = 'FAIL';
+      diagnostics.diagnosis =
+        'Solicitations permission is DENIED. The SP-API returned 403/Access Denied. ' +
+        'Fix: Go to Amazon Developer Console → Edit your SP-API app → Enable "Solicitations" role → ' +
+        'Generate a NEW refresh token with Solicitations scope → Update your .env file with the new token.';
+    } else {
+      diagnostics.result = 'ERROR';
+      diagnostics.diagnosis = `Unexpected error testing Solicitations API: ${message}. This may be a network issue or invalid order ID.`;
+    }
+  }
+
+  // Step 2: Verify order exists (sanity check)
+  try {
+    const orderResponse = await ctx.client.request(
+      {
+        method: 'GET',
+        path: `/orders/v0/orders/${encodeURIComponent(orderId)}`,
+      },
+      'orders'
+    );
+
+    steps.push({
+      step: 'verifyOrderExists',
+      success: true,
+      httpStatus: orderResponse.status,
+      orderStatus: (orderResponse.data as Record<string, unknown>)?.payload
+        ? 'found'
+        : 'unknown_format',
+    });
+  } catch (error) {
+    steps.push({
+      step: 'verifyOrderExists',
+      success: false,
+      error: error instanceof Error ? error.message : String(error),
+    });
+  }
+
+  return JSON.stringify(diagnostics, null, 2);
+}
+
 async function checkReviewEligibility(
   args: Record<string, unknown>,
   ctx: ToolContext
@@ -117,10 +260,22 @@ async function checkReviewEligibility(
     {
       method: 'GET',
       path: `/solicitations/v1/orders/${encodeURIComponent(orderId)}`,
-      queryParams: { MarketplaceIds: ctx.marketplaceId },
+      queryParams: { marketplaceIds: ctx.marketplaceId },
     },
     'solicitations'
   );
+
+  // Check for errors hidden in 200 response body
+  const bodyError = checkResponseForErrors(response.data);
+  if (bodyError) {
+    return JSON.stringify({
+      success: false,
+      orderId,
+      error: bodyError,
+      rawResponse: response.data,
+      hint: 'If you see "Access denied", your SP-API app may not have the Solicitations role. Run test_solicitations_permission to diagnose.',
+    }, null, 2);
+  }
 
   return JSON.stringify(response.data, null, 2);
 }
@@ -133,7 +288,7 @@ async function requestReview(
   const marketplace = args.marketplace as string;
 
   try {
-    await ctx.client.request(
+    const response = await ctx.client.request(
       {
         method: 'POST',
         path: `/solicitations/v1/orders/${encodeURIComponent(orderId)}/solicitations/productReviewAndSellerFeedbackSolicitation`,
@@ -142,6 +297,33 @@ async function requestReview(
       'solicitations'
     );
 
+    // Check for errors hidden in 200/201 response body
+    const bodyError = checkResponseForErrors(response.data);
+    if (bodyError) {
+      const logEntry: ReviewRequestLog = {
+        timestamp: new Date().toISOString(),
+        orderId,
+        marketplace,
+        marketplaceId: ctx.marketplaceId,
+        status: 'error',
+        message: `API returned HTTP ${response.status} but body contains error: ${bodyError}`,
+        httpStatus: response.status,
+        responseBody: response.data,
+      };
+      logReviewRequest(logEntry);
+
+      return JSON.stringify({
+        success: false,
+        orderId,
+        marketplace,
+        status: 'error',
+        message: logEntry.message,
+        hint: 'The API returned a success HTTP code but the response body indicates an error. Run test_solicitations_permission to diagnose.',
+        rawResponse: response.data,
+        timestamp: logEntry.timestamp,
+      }, null, 2);
+    }
+
     const logEntry: ReviewRequestLog = {
       timestamp: new Date().toISOString(),
       orderId,
@@ -149,6 +331,7 @@ async function requestReview(
       marketplaceId: ctx.marketplaceId,
       status: 'success',
       message: 'Review request sent successfully',
+      httpStatus: response.status,
     };
     logReviewRequest(logEntry);
 
@@ -156,6 +339,7 @@ async function requestReview(
       success: true,
       orderId,
       marketplace,
+      httpStatus: response.status,
       message: 'Review request email sent successfully. Amazon will send the email in the buyer\'s preferred language.',
       timestamp: logEntry.timestamp,
     }, null, 2);
@@ -163,6 +347,7 @@ async function requestReview(
     const message = error instanceof Error ? error.message : String(error);
 
     const isNotEligible = message.includes('403') || message.includes('not eligible') || message.includes('FORBIDDEN');
+    const isDenied = message.includes('denied') || message.includes('Unauthorized');
     const logEntry: ReviewRequestLog = {
       timestamp: new Date().toISOString(),
       orderId,
@@ -179,6 +364,11 @@ async function requestReview(
       marketplace,
       status: logEntry.status,
       message,
+      hint: isDenied
+        ? 'Access denied — your SP-API app likely does not have the Solicitations role. Run test_solicitations_permission to diagnose.'
+        : isNotEligible
+          ? 'Order may not be eligible (outside 5-30 day delivery window, or already reviewed).'
+          : undefined,
       timestamp: logEntry.timestamp,
     }, null, 2);
   }
@@ -196,10 +386,62 @@ async function bulkRequestReviews(
   const marketplace = args.marketplace as string;
   const orderIds = orderIdsRaw.split(',').map((id) => id.trim()).filter(Boolean);
 
+  // Step 1: Quick permission check on first order before processing all
+  const firstOrderId = orderIds[0];
+  if (firstOrderId) {
+    try {
+      const testResponse = await ctx.client.request(
+        {
+          method: 'GET',
+          path: `/solicitations/v1/orders/${encodeURIComponent(firstOrderId)}`,
+          queryParams: { marketplaceIds: ctx.marketplaceId },
+        },
+        'solicitations'
+      );
+
+      const bodyError = checkResponseForErrors(testResponse.data);
+      if (bodyError) {
+        return JSON.stringify({
+          summary: {
+            total: orderIds.length,
+            success: 0,
+            not_eligible: 0,
+            errors: orderIds.length,
+          },
+          aborted: true,
+          reason: `Permission check failed: API returned HTTP ${testResponse.status} but body contains error: ${bodyError}`,
+          hint: 'Your SP-API app likely does not have the Solicitations role. Run test_solicitations_permission for full diagnostics.',
+          rawResponse: testResponse.data,
+          results: [],
+        }, null, 2);
+      }
+    } catch (error) {
+      const msg = error instanceof Error ? error.message : String(error);
+      const isDenied = msg.includes('denied') || msg.includes('403') || msg.includes('FORBIDDEN') || msg.includes('Unauthorized');
+
+      if (isDenied) {
+        return JSON.stringify({
+          summary: {
+            total: orderIds.length,
+            success: 0,
+            not_eligible: 0,
+            errors: orderIds.length,
+          },
+          aborted: true,
+          reason: `Solicitations permission DENIED: ${msg}`,
+          hint: 'Fix: Enable Solicitations role on your SP-API app, generate a new refresh token, and update your .env file. Run test_solicitations_permission for full diagnostics.',
+          results: [],
+        }, null, 2);
+      }
+      // Non-permission errors — could be invalid order, proceed with bulk
+    }
+  }
+
   const results: Array<{
     orderId: string;
     status: string;
     message: string;
+    httpStatus?: number;
   }> = [];
 
   let successCount = 0;
@@ -215,7 +457,7 @@ async function bulkRequestReviews(
     }
 
     try {
-      await ctx.client.request(
+      const response = await ctx.client.request(
         {
           method: 'POST',
           path: `/solicitations/v1/orders/${encodeURIComponent(orderId)}/solicitations/productReviewAndSellerFeedbackSolicitation`,
@@ -224,6 +466,30 @@ async function bulkRequestReviews(
         'solicitations'
       );
 
+      // Check for errors hidden in 200 response body
+      const bodyError = checkResponseForErrors(response.data);
+      if (bodyError) {
+        logReviewRequest({
+          timestamp: new Date().toISOString(),
+          orderId,
+          marketplace,
+          marketplaceId: ctx.marketplaceId,
+          status: 'error',
+          message: `HTTP ${response.status} but body error: ${bodyError}`,
+          httpStatus: response.status,
+          responseBody: response.data,
+        });
+
+        results.push({
+          orderId,
+          status: 'error',
+          message: `API returned HTTP ${response.status} but body contains error: ${bodyError}`,
+          httpStatus: response.status,
+        });
+        errorCount++;
+        continue;
+      }
+
       logReviewRequest({
         timestamp: new Date().toISOString(),
         orderId,
@@ -231,9 +497,10 @@ async function bulkRequestReviews(
         marketplaceId: ctx.marketplaceId,
         status: 'success',
         message: 'Review request sent successfully',
+        httpStatus: response.status,
       });
 
-      results.push({ orderId, status: 'success', message: 'Review request sent' });
+      results.push({ orderId, status: 'success', message: 'Review request sent', httpStatus: response.status });
       successCount++;
     } catch (error) {
       const errMsg = error instanceof Error ? error.message : String(error);
@@ -304,6 +571,7 @@ async function getReviewRequestLog(
 }
 
 export const handlers: Record<string, ToolHandler> = {
+  test_solicitations_permission: testSolicitationsPermission,
   check_review_eligibility: checkReviewEligibility,
   request_review: requestReview,
   bulk_request_reviews: bulkRequestReviews,
